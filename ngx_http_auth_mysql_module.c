@@ -10,6 +10,9 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 #include <ngx_md5.h>
+#include <openssl/evp.h>
+#include <openssl/core_names.h>
+#include <openssl/hmac.h>  // For HMAC functionality
 #include <mysql.h>
 
 #include "crypt_private.h"
@@ -20,6 +23,8 @@
 #ifndef BCRYPT_HASH_LEN
 #define BCRYPT_HASH_LEN 60
 #endif
+
+#define SHA384_DIGEST_LENGTH 48  // SHA-384 hash length
 
 /* Module context data */
 typedef struct {
@@ -73,6 +78,8 @@ static ngx_uint_t ngx_http_auth_mysql_check_md5(ngx_http_request_t *r, ngx_str_t
 static ngx_uint_t ngx_http_auth_mysql_check_phpass(ngx_http_request_t *r, ngx_str_t sent_password, ngx_str_t actual_password);
 
 static ngx_uint_t ngx_http_auth_mysql_check_bcrypt(ngx_http_request_t *r, ngx_str_t sent_password, ngx_str_t actual_password);
+
+static ngx_uint_t compare_with_bcrypt(ngx_http_request_t *r, ngx_str_t sent_password, ngx_str_t comparison_pass);
 
 static ngx_int_t ngx_http_auth_mysql_set_realm(ngx_http_request_t *r,
     ngx_str_t *realm);
@@ -559,33 +566,78 @@ phpass_addslashes(u_char *src, u_char *dest) {
 
 static ngx_uint_t
 ngx_http_auth_mysql_check_phpass(ngx_http_request_t *r, ngx_str_t sent_password, ngx_str_t actual_password) {
-	if (ngx_strcmp(actual_password.data, crypt_private(r, sent_password.data, actual_password.data))) {
-		return ngx_http_auth_mysql_check_md5(r, sent_password, actual_password);
-	}
-	return NGX_OK;
+    u_char *computed_hash = (u_char *)crypt_private(r, sent_password.data, actual_password.data);
+    if (computed_hash == NULL || ngx_strcmp(actual_password.data, computed_hash) != 0) {
+        return ngx_http_auth_mysql_check_md5(r, sent_password, actual_password);
+    }
+    return NGX_OK;
 }
+
 
 static ngx_uint_t
 ngx_http_auth_mysql_check_bcrypt(ngx_http_request_t *r, ngx_str_t sent_password, ngx_str_t actual_password) {
-	char output[BCRYPT_HASH_LEN+1];
-	char *null_terminated_sent_pass = ngx_palloc(r->pool, sent_password.len+1);
-	char *null_terminated_actual_pass = ngx_palloc(r->pool, actual_password.len+1);
+    ngx_str_t comparison_pass = actual_password;
 
-	if (!null_terminated_sent_pass || !null_terminated_actual_pass) {
-		ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
-				"auth_mysql: ngx_http_auth_mysql_check_bcrypt: couldn't allocate memory");
-	}
+    // Handle $wp$-prefixed passwords (WordPress-style with SHA-384 HMAC preprocessing)
+    if (actual_password.len >= 4 && ngx_strncmp(actual_password.data, "$wp$", 4) == 0) {
+        comparison_pass.data += 3;
+        comparison_pass.len  -= 3;
 
-	ngx_cpystrn((u_char *) null_terminated_sent_pass, sent_password.data, sent_password.len+1);
-	ngx_cpystrn((u_char *) null_terminated_actual_pass, actual_password.data, actual_password.len+1);
+	const char *hmac_secret = "wp-sha384";
+        unsigned char sha384_hash[SHA384_DIGEST_LENGTH];
 
-	char *hashed_sent_pass = _crypt_blowfish_rn(null_terminated_sent_pass,
-		null_terminated_actual_pass, output, BCRYPT_HASH_LEN+1);
-	if (!hashed_sent_pass || ngx_strcmp(actual_password.data, hashed_sent_pass)) {
-		return ngx_http_auth_mysql_check_phpass(r, sent_password, actual_password);
-	}
+        unsigned int len = 0;
+        unsigned char *result = HMAC(EVP_sha384(), hmac_secret, strlen(hmac_secret), (u_char *) sent_password.data, (int) sent_password.len, sha384_hash, &len);
 
-	return NGX_OK;
+        if (!result || len != SHA384_DIGEST_LENGTH) {
+            ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0, "auth_mysql: HMAC-SHA384 failed");
+            return NGX_ERROR;
+        }
+
+        ngx_str_t sha384_str = { .data = sha384_hash, .len = SHA384_DIGEST_LENGTH };
+        ngx_str_t base64_str = {
+            .len = ngx_base64_encoded_length(sha384_str.len),
+            .data = ngx_palloc(r->pool, ngx_base64_encoded_length(sha384_str.len))
+        };
+
+        if (base64_str.data == NULL) {
+            ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0, "auth_mysql: failed to allocate base64 buffer");
+            return NGX_ERROR;
+        }
+
+        ngx_encode_base64(&base64_str, &sha384_str);
+
+        return compare_with_bcrypt(r, base64_str, comparison_pass);
+    }
+
+    return compare_with_bcrypt(r, sent_password, comparison_pass);
+}
+
+
+static ngx_uint_t
+compare_with_bcrypt(ngx_http_request_t *r, ngx_str_t sent_password, ngx_str_t comparison_pass) {
+    char output[BCRYPT_HASH_LEN + 1];
+
+    char *sent = ngx_pnalloc(r->pool, sent_password.len + 1);
+    char *stored = ngx_pnalloc(r->pool, comparison_pass.len + 1);
+    if (!sent || !stored) {
+        ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
+                      "auth_mysql: compare_with_bcrypt: memory allocation failed");
+        return NGX_ERROR;
+    }
+
+    ngx_memcpy(sent, sent_password.data, sent_password.len);
+    sent[sent_password.len] = '\0';
+
+    ngx_memcpy(stored, comparison_pass.data, comparison_pass.len);
+    stored[comparison_pass.len] = '\0';
+
+    char *result = _crypt_blowfish_rn(sent, stored, output, sizeof(output));
+    if (!result || ngx_strncmp((u_char *)result, comparison_pass.data, comparison_pass.len) != 0) {
+        return ngx_http_auth_mysql_check_phpass(r, sent_password, comparison_pass);
+    }
+
+    return NGX_OK;
 }
 
 static ngx_int_t

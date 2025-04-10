@@ -69,7 +69,7 @@ $t->run();
 like(http_get('/'), qr!401 Unauthorized!ms, 'rejects unathorized');
 like(http_get_auth('/', 'test1', 'password'), qr!SEETHIS!, 'phpass $P$');
 like(http_get_auth('/', 'test2', 'password'), qr!SEETHIS!, 'bcrypt $2y$');
-unlike(http_get_auth('/', 'test3', 'password'), qr!SEETHIS!, 'WP bcrypt $wp$');
+like(http_get_auth('/', 'test3', 'password'), qr!SEETHIS!, 'WP bcrypt $wp$');
 like(http_get_auth('/', 'test1', 'password11'), qr!401 Unauthorized!, 'invalid test1 password');
 like(http_get_auth('/', 'crypt2', '1'), qr!401 Unauthorized!, 'invalid user');
 
