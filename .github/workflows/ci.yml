@@ -1,0 +1,88 @@
+name: Build and Test NGINX Module
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    env:
+      NGINX_VERSION: 1.27.4
+      MYSQL_DATABASE: nginx_mysql
+      BUILD_DIR: ${{ github.workspace }}/build
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Cache APT packages
+        uses: actions/cache@v3
+        with:
+          path: |
+            /var/cache/apt/archives
+            /var/lib/apt/lists
+          key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-apt-
+
+      - name: Start and configure MySQL
+        run: |
+          sudo service mysql start
+
+          until mysqladmin ping --silent; do
+            echo "Waiting for MySQL..."
+            sleep 2
+          done
+          sudo bash -c "mysql -uroot -proot <<EOF
+          CREATE DATABASE IF NOT EXISTS ${MYSQL_DATABASE};
+          USE ${MYSQL_DATABASE};
+          CREATE TABLE users (
+              id INT AUTO_INCREMENT PRIMARY KEY,
+              user_login VARCHAR(50) NOT NULL UNIQUE,
+              user_pass VARCHAR(255) NOT NULL
+          );
+          INSERT INTO users (user_login, user_pass) VALUES ('test1', '\\\$2y\\\$10\\\$KIMXDMJq9camkaNHkdrmcOaYJ0AT9lvovEf92yWA34sKdfnn97F9i'),('test2', '\\\$P\\\$BDMJH/qCLaUc5Lj8Oiwp7XmWzrCcJ21'),('test3', '\\\$wp\\\$2y\\\$10\\\$81DGgP9uzWr8j4JE4tPIa.kSiG7T5560nkXOPzw8AgZfNYShvhmi6');
+          EOF"
+
+      - name: Show database
+        run: |
+          bash -c "mysql -uroot -proot ${MYSQL_DATABASE} -e 'SHOW CREATE TABLE users;'"
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cpanminus \
+            gcc \
+            git \
+            make \
+            libpcre3-dev \
+            zlib1g-dev \
+            libmysqlclient-dev \
+            wget
+
+      - name: Download and build NGINX with custom module
+        run: |
+          mkdir -p "$BUILD_DIR"
+          cd "$BUILD_DIR"
+          wget http://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz
+          tar -xzf nginx-${NGINX_VERSION}.tar.gz
+          mv nginx-${NGINX_VERSION} nginx
+          cd nginx
+          ./configure --with-compat --add-module=${{ github.workspace }}
+          make
+          make modules
+
+      - name: Prepare nginx-tests and run tests
+        run: |
+          cd $BUILD_DIR
+          # Clone nginx-tests in the same build folder
+          git clone https://github.com/nginx/nginx-tests.git
+          # Copy test file that may depend on built objects such as objs/nginx
+          cp ${{ github.workspace }}/mysql_auth.t ./nginx-tests/
+          # Make sure the test script is executable and then run it
+          cd nginx-tests
+          prove mysql_auth.t
