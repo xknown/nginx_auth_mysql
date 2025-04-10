@@ -17,17 +17,13 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - name: Cache APT packages
-        uses: actions/cache@v3
+      - name: Install build dependencies
+        uses: awalsh128/cache-apt-pkgs-action@5902b33ae29014e6ca012c5d8025d4346556bd40
         with:
-          path: |
-            /var/cache/apt/archives
-            /var/lib/apt/lists
-          key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/ci.yml') }}
-          restore-keys: |
-            ${{ runner.os }}-apt-
+          packages: libmysqlclient-dev
+          version: 1.0
 
       - name: Start and configure MySQL
         run: |
@@ -51,18 +47,6 @@ jobs:
       - name: Show database
         run: |
           bash -c "mysql -uroot -proot ${MYSQL_DATABASE} -e 'SHOW CREATE TABLE users;'"
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            cpanminus \
-            gcc \
-            git \
-            make \
-            libpcre3-dev \
-            zlib1g-dev \
-            libmysqlclient-dev \
-            wget
 
       - name: Download and build NGINX with custom module
         run: |
