@@ -56,13 +56,32 @@ typedef struct {
 	ngx_str_t group_column;	
 	ngx_str_t group_conditions;
 	ngx_str_t conditions;
+	ngx_flag_t cache_enable;
+	ngx_msec_t cache_timeout;
+	ngx_str_t cache_secret;
 } ngx_http_auth_mysql_loc_conf_t;
 
 /* Encryption types */
 typedef struct {
 	ngx_str_t id;
-	ngx_uint_t (*checker)(ngx_http_request_t *r, ngx_str_t sent_password, ngx_str_t actual_password);
+	ngx_uint_t (*checker)(ngx_http_request_t *r, ngx_str_t sent_password, ngx_str_t actual_password, ngx_str_t username);
 } ngx_http_auth_mysql_enctype_t;
+
+/** Auth cache */
+typedef struct {
+    ngx_rbtree_node_t node;
+    ngx_str_t username;
+    u_char *password_hash;
+	ngx_msec_t expires;
+} ngx_http_auth_mysql_cache_entry_t;
+
+typedef struct {
+    ngx_slab_pool_t   *shpool;              /* Slab pool for memory allocation */
+    ngx_rbtree_t      rbtree;
+    ngx_rbtree_node_t *sentinel;
+} ngx_http_auth_mysql_cache_ctx_t;
+
+
 
 /* Module handler */
 static ngx_int_t ngx_http_auth_mysql_handler(ngx_http_request_t *r);
@@ -71,15 +90,21 @@ static ngx_int_t ngx_http_auth_mysql_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_auth_mysql_authenticate(ngx_http_request_t *r,
     ngx_http_auth_mysql_ctx_t *ctx, ngx_str_t *passwd, void *conf);
 
-static ngx_uint_t ngx_http_auth_mysql_check_plain(ngx_http_request_t *r, ngx_str_t sent_password, ngx_str_t actual_password);
+static ngx_uint_t ngx_http_auth_mysql_check_plain(ngx_http_request_t *r, ngx_str_t sent_password, ngx_str_t actual_password, ngx_str_t username);
 
-static ngx_uint_t ngx_http_auth_mysql_check_md5(ngx_http_request_t *r, ngx_str_t sent_password, ngx_str_t actual_password);
+static ngx_uint_t ngx_http_auth_mysql_check_md5(ngx_http_request_t *r, ngx_str_t sent_password, ngx_str_t actual_password, ngx_str_t username);
 
-static ngx_uint_t ngx_http_auth_mysql_check_phpass(ngx_http_request_t *r, ngx_str_t sent_password, ngx_str_t actual_password);
+static ngx_uint_t ngx_http_auth_mysql_check_phpass(ngx_http_request_t *r, ngx_str_t sent_password, ngx_str_t actual_password, ngx_str_t username);
 
-static ngx_uint_t ngx_http_auth_mysql_check_bcrypt(ngx_http_request_t *r, ngx_str_t sent_password, ngx_str_t actual_password);
+static ngx_uint_t ngx_http_auth_mysql_check_bcrypt(ngx_http_request_t *r, ngx_str_t sent_password, ngx_str_t actual_password, ngx_str_t username);
 
-static ngx_uint_t compare_with_bcrypt(ngx_http_request_t *r, ngx_str_t sent_password, ngx_str_t comparison_pass);
+static ngx_uint_t ngx_http_auth_mysql_compare_with_bcrypt(ngx_http_request_t *r, ngx_str_t sent_password,
+ngx_str_t hashed_pass, ngx_str_t username);
+
+static ngx_int_t ngx_http_auth_mysql_cache_init_zone(ngx_shm_zone_t *shm_zone, void *data);
+
+static void ngx_http_auth_mysql_cache_set(ngx_http_request_t *r, ngx_str_t username, u_char *password_hash);
+static ngx_http_auth_mysql_cache_entry_t *ngx_http_auth_mysql_cache_get(ngx_http_request_t *r, ngx_str_t username);
 
 static ngx_int_t ngx_http_auth_mysql_set_realm(ngx_http_request_t *r,
     ngx_str_t *realm);
@@ -101,6 +126,8 @@ static u_char * ngx_http_auth_mysql_append3(ngx_pool_t *pool, u_char *base, u_ch
 #ifdef PHPASS_ADDSLASHES
 static void phpass_addslashes(u_char *src, u_char *dest);
 #endif
+
+static ngx_shm_zone_t *user_auth_zone;
 
 static ngx_conf_post_handler_pt  ngx_http_auth_mysql_p = ngx_http_auth_mysql;
 
@@ -241,7 +268,28 @@ static ngx_command_t ngx_http_auth_mysql_commands[] = {
 	ngx_conf_set_str_slot,
 	NGX_HTTP_LOC_CONF_OFFSET,
 	offsetof(ngx_http_auth_mysql_loc_conf_t, conditions),
-	NULL }
+	NULL },
+
+	{ ngx_string("auth_mysql_cache_enable"),
+    NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_HTTP_LMT_CONF|NGX_CONF_FLAG,
+    ngx_conf_set_flag_slot,
+    NGX_HTTP_LOC_CONF_OFFSET,
+    offsetof(ngx_http_auth_mysql_loc_conf_t, cache_enable),
+    NULL },
+
+	{ ngx_string("auth_mysql_cache_ttl"),
+    NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_HTTP_LMT_CONF|NGX_CONF_TAKE1,
+    ngx_conf_set_msec_slot,
+    NGX_HTTP_LOC_CONF_OFFSET,
+    offsetof(ngx_http_auth_mysql_loc_conf_t, cache_timeout),
+    NULL },
+
+	{ ngx_string("auth_mysql_cache_secret"),
+    NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_HTTP_LMT_CONF|NGX_CONF_TAKE1,
+    ngx_conf_set_str_slot,
+    NGX_HTTP_LOC_CONF_OFFSET,
+    offsetof(ngx_http_auth_mysql_loc_conf_t, cache_secret),
+    NULL }
 };
 
 
@@ -267,7 +315,7 @@ ngx_module_t  ngx_http_auth_mysql_module = {
     NGX_HTTP_MODULE,                       /* module type */
     NULL,                                  /* init master */
     NULL,                                  /* init module */
-    NULL,                                  /* init process */
+    NULL,        /* init process */
     NULL,                                  /* init thread */
     NULL,                                  /* exit thread */
     NULL,                                  /* exit process */
@@ -503,7 +551,9 @@ ngx_http_auth_mysql_authenticate(ngx_http_request_t *r,
 #endif
 
 	auth_res = NGX_OK;
-	auth_res = ngx_http_auth_mysql_enctypes[alcf->encryption_type].checker(r, escaped_sent_pw, actual_password);
+	auth_res = ngx_http_auth_mysql_enctypes[alcf->encryption_type].checker(r, escaped_sent_pw, actual_password, uinfo.username);
+    ngx_explicit_memzero(escaped_sent_pw.data, escaped_sent_pw.len);
+    ngx_explicit_memzero(uinfo.password.data, uinfo.password.len);
 	if (NGX_DECLINED == auth_res) {
 		ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
 			"auth_mysql: Bad authentication for user '%s'.", (char*)uinfo.username.data);
@@ -517,12 +567,12 @@ ngx_http_auth_mysql_authenticate(ngx_http_request_t *r,
 }
 
 static ngx_uint_t
-ngx_http_auth_mysql_check_plain(ngx_http_request_t *r, ngx_str_t sent_password, ngx_str_t actual_password) {
+ngx_http_auth_mysql_check_plain(ngx_http_request_t *r, ngx_str_t sent_password, ngx_str_t actual_password, ngx_str_t username) {
 	return (ngx_strcmp(actual_password.data, sent_password.data) == 0)? NGX_OK : NGX_DECLINED;
 }
 
 static ngx_uint_t
-ngx_http_auth_mysql_check_md5(ngx_http_request_t *r, ngx_str_t sent_password, ngx_str_t actual_password) {
+ngx_http_auth_mysql_check_md5(ngx_http_request_t *r, ngx_str_t sent_password, ngx_str_t actual_password, ngx_str_t username) {
 	u_char md5_str[2*MD5_DIGEST_LENGTH + 1];
 	u_char md5_digest[MD5_DIGEST_LENGTH];	
 	ngx_md5_t md5;
@@ -565,17 +615,17 @@ phpass_addslashes(u_char *src, u_char *dest) {
 #endif
 
 static ngx_uint_t
-ngx_http_auth_mysql_check_phpass(ngx_http_request_t *r, ngx_str_t sent_password, ngx_str_t actual_password) {
+ngx_http_auth_mysql_check_phpass(ngx_http_request_t *r, ngx_str_t sent_password, ngx_str_t actual_password, ngx_str_t username) {
     u_char *computed_hash = (u_char *)crypt_private(r, sent_password.data, actual_password.data);
     if (computed_hash == NULL || ngx_strcmp(actual_password.data, computed_hash) != 0) {
-        return ngx_http_auth_mysql_check_md5(r, sent_password, actual_password);
+        return NGX_DECLINED;
     }
     return NGX_OK;
 }
 
 
 static ngx_uint_t
-ngx_http_auth_mysql_check_bcrypt(ngx_http_request_t *r, ngx_str_t sent_password, ngx_str_t actual_password) {
+ngx_http_auth_mysql_check_bcrypt(ngx_http_request_t *r, ngx_str_t sent_password, ngx_str_t actual_password, ngx_str_t username) {
     ngx_str_t comparison_pass = actual_password;
 
     // Handle $wp$-prefixed passwords (WordPress-style with SHA-384 HMAC preprocessing)
@@ -583,7 +633,7 @@ ngx_http_auth_mysql_check_bcrypt(ngx_http_request_t *r, ngx_str_t sent_password,
         comparison_pass.data += 3;
         comparison_pass.len  -= 3;
 
-	const char *hmac_secret = "wp-sha384";
+		const char *hmac_secret = "wp-sha384";
         unsigned char sha384_hash[SHA384_DIGEST_LENGTH];
 
         unsigned int len = 0;
@@ -601,22 +651,61 @@ ngx_http_auth_mysql_check_bcrypt(ngx_http_request_t *r, ngx_str_t sent_password,
         };
 
         if (base64_str.data == NULL) {
+            ngx_explicit_memzero(sha384_hash, sizeof(sha384_hash));
             ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0, "auth_mysql: failed to allocate base64 buffer");
             return NGX_ERROR;
         }
 
         ngx_encode_base64(&base64_str, &sha384_str);
+        ngx_explicit_memzero(sha384_hash, sizeof(sha384_hash));
 
-        return compare_with_bcrypt(r, base64_str, comparison_pass);
+        ngx_uint_t auth_result = ngx_http_auth_mysql_compare_with_bcrypt(r, base64_str, comparison_pass, username);
+        ngx_explicit_memzero(base64_str.data, base64_str.len);
+        return auth_result;
     }
 
-    return compare_with_bcrypt(r, sent_password, comparison_pass);
+    return ngx_http_auth_mysql_compare_with_bcrypt(r, sent_password, comparison_pass, username);
 }
 
-
 static ngx_uint_t
-compare_with_bcrypt(ngx_http_request_t *r, ngx_str_t sent_password, ngx_str_t comparison_pass) {
+ngx_http_auth_mysql_compare_with_bcrypt(ngx_http_request_t *r, ngx_str_t sent_password, ngx_str_t comparison_pass, ngx_str_t username) {
     char output[BCRYPT_HASH_LEN + 1];
+
+	ngx_http_auth_mysql_loc_conf_t  *alcf;
+    ngx_http_auth_mysql_cache_entry_t *entry;
+
+	ngx_str_t payload;
+
+	alcf = ngx_http_get_module_loc_conf(r, ngx_http_auth_mysql_module);
+
+	payload.len = sent_password.len + comparison_pass.len;
+	payload.data = ngx_palloc(r->pool, payload.len);
+	if (payload.data == NULL) {
+        ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
+                      "auth_mysql: compare_with_bcrypt: memory allocation failed");
+        return NGX_ERROR;
+    }
+	ngx_memcpy(payload.data, sent_password.data, sent_password.len);
+	ngx_memcpy(payload.data + sent_password.len, comparison_pass.data, comparison_pass.len);
+
+	const char *hmac_secret = (const char*)alcf->cache_secret.data;
+	unsigned char sha384_hash[SHA384_DIGEST_LENGTH];
+	unsigned int len = 0;
+    u_char *hmac = HMAC(EVP_sha384(), hmac_secret, strlen(hmac_secret), (u_char *) payload.data, (int) payload.len, sha384_hash, &len);
+
+    ngx_explicit_memzero(payload.data, payload.len);
+
+    if (!hmac || len != SHA384_DIGEST_LENGTH) {
+		ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0, "auth_mysql: HMAC-SHA384 failed");
+		return NGX_ERROR;
+	}
+
+	if (alcf->cache_enable) {
+		entry = ngx_http_auth_mysql_cache_get(r, username);
+		if (entry) {
+			return ngx_strncmp(hmac, entry->password_hash, SHA384_DIGEST_LENGTH) == 0 ? NGX_OK : NGX_DECLINED;
+		}
+	}
 
     char *sent = ngx_pnalloc(r->pool, sent_password.len + 1);
     char *stored = ngx_pnalloc(r->pool, comparison_pass.len + 1);
@@ -633,11 +722,173 @@ compare_with_bcrypt(ngx_http_request_t *r, ngx_str_t sent_password, ngx_str_t co
     stored[comparison_pass.len] = '\0';
 
     char *result = _crypt_blowfish_rn(sent, stored, output, sizeof(output));
+    ngx_explicit_memzero(sent, sent_password.len);
+    ngx_explicit_memzero(stored, comparison_pass.len);
     if (!result || ngx_strncmp((u_char *)result, comparison_pass.data, comparison_pass.len) != 0) {
-        return ngx_http_auth_mysql_check_phpass(r, sent_password, comparison_pass);
+        return ngx_http_auth_mysql_check_phpass(r, sent_password, comparison_pass, username);
     }
+    ngx_explicit_memzero(output, sizeof(output));
+
+	if (alcf->cache_enable) {
+        ngx_http_auth_mysql_cache_set(r, username, hmac);
+	}
 
     return NGX_OK;
+}
+
+static ngx_int_t ngx_http_auth_mysql_cache_init_zone(ngx_shm_zone_t *shm_zone, void *data) {
+    ngx_http_auth_mysql_cache_ctx_t *ctx;
+
+    if (data) {
+        shm_zone->data = data;
+        return NGX_OK;
+    }
+	ngx_slab_pool_t *shpool = (ngx_slab_pool_t *) shm_zone->shm.addr;
+    ctx = ngx_slab_alloc(shpool, sizeof(ngx_http_auth_mysql_cache_ctx_t));
+    if (ctx == NULL) {
+        return NGX_ERROR;
+    }
+
+    ctx->shpool = shpool;
+
+    ctx->sentinel = ngx_slab_alloc(shpool, sizeof(ngx_rbtree_node_t));
+    if (ctx->sentinel == NULL) {
+        return NGX_ERROR;
+    }
+    ngx_rbtree_sentinel_init(ctx->sentinel);
+    ngx_rbtree_init(&ctx->rbtree, ctx->sentinel, ngx_rbtree_insert_value);
+
+    shm_zone->data = ctx;
+
+    return NGX_OK;
+}
+
+static void ngx_http_auth_mysql_cache_set(ngx_http_request_t *r, ngx_str_t username, u_char *password_hash) {
+    ngx_http_auth_mysql_cache_ctx_t *ctx = user_auth_zone->data;
+    ngx_slab_pool_t *shpool = ctx->shpool;
+    uint32_t hash;
+    ngx_rbtree_node_t          *node, *sentinel;
+    ngx_msec_t                  now;
+    ngx_http_auth_mysql_cache_entry_t *entry;
+    ngx_http_auth_mysql_loc_conf_t  *alcf;
+
+    alcf = ngx_http_get_module_loc_conf(r, ngx_http_auth_mysql_module);
+
+    hash = ngx_crc32_short(username.data, username.len);
+    now = ngx_current_msec;
+
+    ngx_shmtx_lock(&shpool->mutex);
+
+    node = ctx->rbtree.root;
+    sentinel = ctx->rbtree.sentinel;
+
+    while (node != sentinel) {
+        if (hash < node->key) {
+            node = node->left;
+            continue;
+        }
+
+        if (hash > node->key) {
+            node = node->right;
+            continue;
+        }
+        entry = (ngx_http_auth_mysql_cache_entry_t *) node;
+
+        if (entry->username.len == username.len &&
+            ngx_memcmp(entry->username.data, username.data, username.len) == 0 &&
+            entry->password_hash &&
+            ngx_memcmp(password_hash, entry->password_hash, SHA384_DIGEST_LENGTH) == 0) {
+            /* Found the entry, update it */
+            entry->expires = now + alcf->cache_timeout;
+            ngx_shmtx_unlock(&shpool->mutex);
+            return;
+        }
+        node = (hash < node->key) ? node->left : node->right;
+    }
+
+    // Create new entry
+    entry = ngx_slab_alloc_locked(shpool, sizeof(ngx_http_auth_mysql_cache_entry_t));
+    if (entry == NULL) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "[auth_cache] Failed to allocate cache node");
+        ngx_shmtx_unlock(&shpool->mutex);
+        return;
+    }
+    ngx_memzero(entry, sizeof(ngx_http_auth_mysql_cache_entry_t));
+
+    entry->node.key = hash;
+    entry->expires = now + alcf->cache_timeout;
+
+    entry->username.len = username.len;
+    entry->username.data = ngx_slab_alloc_locked(shpool, username.len);
+    if (entry->username.data == NULL) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "[auth_cache] Failed to allocate username data");
+        ngx_slab_free_locked(shpool, entry);
+        ngx_shmtx_unlock(&shpool->mutex);
+        return;
+    }
+    ngx_memcpy(entry->username.data, username.data, username.len);
+
+    entry->password_hash = ngx_slab_alloc_locked(shpool, SHA384_DIGEST_LENGTH);
+    if (entry->password_hash == NULL) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "[auth_cache] Failed to allocate password_hash");
+        ngx_slab_free_locked(shpool, entry->username.data);
+        ngx_slab_free_locked(shpool, entry);
+        ngx_shmtx_unlock(&shpool->mutex);
+        return;
+    }
+    ngx_memcpy(entry->password_hash, password_hash, SHA384_DIGEST_LENGTH);
+
+    ngx_rbtree_insert(&ctx->rbtree, &entry->node);
+
+    ngx_shmtx_unlock(&shpool->mutex);
+}
+
+static ngx_http_auth_mysql_cache_entry_t *ngx_http_auth_mysql_cache_get(ngx_http_request_t *r, ngx_str_t username) {
+    ngx_http_auth_mysql_cache_ctx_t *ctx = user_auth_zone->data;
+    ngx_slab_pool_t            *shpool;
+    ngx_rbtree_node_t          *node, *sentinel;
+    uint32_t hash;
+
+    shpool = ctx->shpool;
+    hash = ngx_crc32_short(username.data, username.len);
+
+    ngx_shmtx_lock(&shpool->mutex);
+
+    node = ctx->rbtree.root;
+    sentinel = ctx->rbtree.sentinel;
+
+    while (node != sentinel) {
+        if (hash < node->key) {
+            node = node->left;
+            continue;
+        }
+
+        if (hash > node->key) {
+            node = node->right;
+            continue;
+        }
+        ngx_http_auth_mysql_cache_entry_t *entry = (ngx_http_auth_mysql_cache_entry_t *) node;
+        if (username.len == entry->username.len &&
+            ngx_strncmp(username.data, entry->username.data, username.len) == 0) {
+            ngx_msec_t now;
+            now = ngx_current_msec;
+
+            if (entry->expires < now) {
+                ngx_rbtree_delete(&ctx->rbtree, node);
+                ngx_slab_free_locked(shpool, node);
+
+                ngx_shmtx_unlock(&shpool->mutex);
+                return NULL;
+            }
+            ngx_shmtx_unlock(&shpool->mutex);
+            return entry;
+        }
+        /* Hash collision, continue search */
+        node = (hash < node->key) ? node->left : node->right;
+    }
+
+    ngx_shmtx_unlock(&shpool->mutex);
+    return NULL;
 }
 
 static ngx_int_t
@@ -670,6 +921,8 @@ ngx_http_auth_mysql_create_loc_conf(ngx_conf_t *cf)
     }
 
 	conf->port = NGX_CONF_UNSET_UINT;
+	conf->cache_enable = NGX_CONF_UNSET;
+    conf->cache_timeout = NGX_CONF_UNSET_MSEC;
 
     return conf;
 }
@@ -705,10 +958,19 @@ ngx_http_auth_mysql_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 	ngx_conf_merge_str_value( conf->group_table, prev->group_table, "");
 	ngx_conf_merge_str_value( conf->group_conditions, prev->group_conditions, "");
 	ngx_conf_merge_str_value( conf->conditions, prev->conditions, "");
+	ngx_conf_merge_value(conf->cache_enable, prev->cache_enable, 0);
+    ngx_conf_merge_msec_value(conf->cache_timeout, prev->cache_timeout, 300000); /* Default 300 seconds */
+	ngx_conf_merge_str_value( conf->cache_secret, prev->cache_secret, "");
 	
 	if (ngx_strcmp(conf->database.data, "") == 0) {
 		ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, 
 	            "You have to specify a database to use to in auth_mysql_database.");
+	    return NGX_CONF_ERROR;
+	}
+
+	if (conf->cache_enable && ngx_strcmp(conf->cache_secret.data, "") == 0) {
+		ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, 
+	            "You have to specify a auth_mysql_cache_secret if you enable the auth cache.");
 	    return NGX_CONF_ERROR;
 	}
 	
@@ -740,6 +1002,15 @@ ngx_http_auth_mysql_init(ngx_conf_t *cf)
     if (h == NULL) {
         return NGX_ERROR;
     }
+
+    ngx_str_t shm_name = ngx_string("mysql_user_auth_zone");
+    user_auth_zone = ngx_shared_memory_add(cf, &shm_name, 1 * 1024 * 1024, &ngx_http_auth_mysql_module);
+    if (user_auth_zone == NULL) {
+        return NGX_ERROR;
+    }
+
+    user_auth_zone->init = ngx_http_auth_mysql_cache_init_zone;
+    user_auth_zone->data = NULL;
 
     *h = ngx_http_auth_mysql_handler;
 
